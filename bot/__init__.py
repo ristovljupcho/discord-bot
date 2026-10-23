@@ -1,0 +1,1 @@
+"""Personal Discord server bot."""
