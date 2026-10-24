@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import discord
 from discord.ext import commands
 
-from bot.audio import PlaybackError, Track, resolve_track, youtube_url
+from bot.audio import PlaybackError, Playlist, Track, resolve_playlist, resolve_track, youtube_url
 from bot.config import Settings
 from bot.membership import Membership
-from bot.music import Music, Request
+from bot.music import MAX_QUEUE, Music, Request
 from bot.__main__ import PersonalBot
 
 
@@ -23,6 +23,7 @@ ENV = {
     "GOODBYE_CHANNEL_ID": "301",
 }
 URL = "https://www.youtube.com/watch?v=BaW_jenozKc"
+PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLtest123456"
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -65,9 +66,20 @@ class URLTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(youtube_url(value), URL)
 
-    def test_rejects_playlists_and_untrusted_inputs(self):
+    def test_playlist_links_are_canonicalized(self):
         for value in (
-            URL + "&list=PLtest", "https://youtube.com/playlist?list=PLtest",
+            PLAYLIST_URL, URL + "&list=PLtest123456&index=5",
+            "https://youtu.be/BaW_jenozKc?list=PLtest123456",
+            "https://music.youtube.com/playlist?list=PLtest123456",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(youtube_url(value), PLAYLIST_URL)
+
+    def test_rejects_mixes_invalid_playlists_and_untrusted_inputs(self):
+        for value in (
+            URL + "&list=RDtest123456", "https://youtube.com/playlist?list=",
+            PLAYLIST_URL + "&list=PLother", "https://youtube.com/playlist?list=bad%26id",
+            "https://evil.example/playlist?list=PLtest123456", "https://youtube.com/playlist",
             "https://open.spotify.com/track/test", "http://youtu.be/BaW_jenozKc",
             "https://youtube.com.evil.example/watch?v=BaW_jenozKc",
             "https://user:password@youtu.be/BaW_jenozKc", "file:///etc/passwd",
@@ -113,6 +125,40 @@ class ResolverTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.audio.asyncio.create_subprocess_exec", AsyncMock(return_value=self.process(returncode=1))):
             with self.assertRaisesRegex(PlaybackError, "could not provide"):
                 await resolve_track(URL)
+
+    async def test_playlist_preserves_order_duplicates_and_skips_inaccessible_entries(self):
+        process = self.process({"title": "Test playlist", "entries": [
+            {"id": "abcdefghijk", "title": "First"},
+            {"id": "BaW_jenozKc", "title": "Second"},
+            {"id": "abcdefghijk", "title": "Repeated"},
+            {"id": "abcdefghijk", "title": "[Private video]"},
+            {"id": "abcdefghijk", "availability": "private"},
+            {"id": "abcdefghijk", "live_status": "is_live"},
+            {"id": "https://127.0.0.1/bad"}, None,
+        ]})
+        with patch("bot.audio.asyncio.create_subprocess_exec", AsyncMock(return_value=process)) as spawn:
+            playlist = await resolve_playlist(PLAYLIST_URL, limit=MAX_QUEUE)
+        self.assertEqual(playlist.urls, (
+            "https://www.youtube.com/watch?v=abcdefghijk", URL,
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        ))
+        self.assertEqual(playlist.skipped, 5)
+        self.assertIn("--flat-playlist", spawn.call_args.args)
+        self.assertIn(f"1:{MAX_QUEUE + 1}", spawn.call_args.args)
+        self.assertNotIn("--format", spawn.call_args.args)
+
+    async def test_playlist_rejects_empty_malformed_and_over_limit_responses(self):
+        for data in ({}, {"entries": []}, {"entries": [None]}, {"entries": [None] * 3}):
+            with self.subTest(data=data), patch(
+                "bot.audio.asyncio.create_subprocess_exec", AsyncMock(return_value=self.process(data))
+            ), self.assertRaises(PlaybackError):
+                await resolve_playlist(PLAYLIST_URL, limit=2)
+
+    async def test_track_resolver_does_not_expand_a_playlist(self):
+        with patch("bot.audio.asyncio.create_subprocess_exec", AsyncMock()) as spawn:
+            with self.assertRaises(PlaybackError):
+                await resolve_track(PLAYLIST_URL)
+            spawn.assert_not_awaited()
 
     async def test_timeout_kills_and_reaps_extractor(self):
         process = self.process(returncode=None)
@@ -296,10 +342,54 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.send.assert_awaited_once()
 
     async def test_queue_limit(self):
-        for _ in range(50):
+        for _ in range(MAX_QUEUE):
             self.cog.queue.put_nowait(Request(URL, self.channel))
         with self.assertRaisesRegex(PlaybackError, "queue is full"):
             await self.cog.play.callback(self.cog, self.ctx, URL)
+
+    async def test_playlist_is_queued_as_individual_tracks_in_order(self):
+        second = "https://www.youtube.com/watch?v=abcdefghijk"
+        playlist = Playlist("Test", (URL, second), 1)
+        with patch("bot.music.resolve_playlist", AsyncMock(return_value=playlist)):
+            await self.cog.play.callback(self.cog, self.ctx, PLAYLIST_URL)
+        self.assertEqual(self.cog.queue.get_nowait().url, URL)
+        self.assertEqual(self.cog.queue.get_nowait().url, second)
+        self.assertIn("Queued 2 videos", self.ctx.send.call_args.args[0])
+        self.assertIn("Skipped 1", self.ctx.send.call_args.args[0])
+        self.assertFalse(self.cog.playlist_tasks)
+
+    async def test_playlist_that_will_not_fit_is_rejected_without_partial_enqueue(self):
+        for _ in range(MAX_QUEUE - 1):
+            self.cog.queue.put_nowait(Request(URL, self.channel))
+        with patch("bot.music.resolve_playlist", AsyncMock(return_value=Playlist("Test", (URL, URL), 0))):
+            with self.assertRaisesRegex(PlaybackError, "Nothing was added"):
+                await self.cog.play.callback(self.cog, self.ctx, PLAYLIST_URL)
+        self.assertEqual(self.cog.queue.qsize(), MAX_QUEUE - 1)
+
+    async def test_playlist_loading_does_not_block_stop_or_enqueue_after_stop(self):
+        started = asyncio.Event()
+
+        async def load(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch("bot.music.resolve_playlist", side_effect=load):
+            command = asyncio.create_task(self.cog.play.callback(self.cog, self.ctx, PLAYLIST_URL))
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(self.cog.stop_session(), 1)
+            with self.assertRaisesRegex(PlaybackError, "cancelled"):
+                await command
+        self.assertTrue(self.cog.queue.empty())
+        self.assertFalse(self.cog.playlist_tasks)
+        self.voice.disconnect.assert_awaited_once()
+
+    async def test_failed_playlist_leaves_existing_queue_intact(self):
+        self.cog.queue.put_nowait(Request(URL, self.channel))
+        with patch("bot.music.resolve_playlist", AsyncMock(side_effect=PlaybackError("Unavailable"))):
+            with self.assertRaises(PlaybackError):
+                await self.cog.play.callback(self.cog, self.ctx, PLAYLIST_URL)
+        self.assertEqual(self.cog.queue.qsize(), 1)
+        self.assertFalse(self.cog.playlist_tasks)
 
     async def test_queue_progresses_after_failed_track(self):
         first = Request(URL, self.channel)

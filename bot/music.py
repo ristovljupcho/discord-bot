@@ -3,17 +3,18 @@ from dataclasses import dataclass
 import logging
 import subprocess
 import time
+from urllib.parse import urlsplit
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from bot.audio import PlaybackError, Track, resolve_track, youtube_url
+from bot.audio import PlaybackError, Track, resolve_playlist, resolve_track, youtube_url
 from bot.config import Settings
 
 log = logging.getLogger(__name__)
 IDLE_SECONDS = 300
-MAX_QUEUE = 50
+MAX_QUEUE = 1000
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class Music(commands.Cog):
         self.track: Track | None = None
         self.active_task: asyncio.Task | None = None
         self.worker: asyncio.Task | None = None
+        self.playlist_tasks: set[asyncio.Task] = set()
         self.lock = asyncio.Lock()
         self.idle_since: float | None = None
         self.empty_since: float | None = None
@@ -136,6 +138,12 @@ class Music(commands.Cog):
                 self.queue.task_done()
 
     async def stop_session(self) -> None:
+        if self.playlist_tasks:
+            pending = list(self.playlist_tasks)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self.playlist_tasks.clear()
         while not self.queue.empty():
             self.queue.get_nowait()
             self.queue.task_done()
@@ -160,7 +168,7 @@ class Music(commands.Cog):
                 await self.stop_session()
                 return
             now = time.monotonic()
-            idle = self.current is None and self.queue.empty()
+            idle = self.current is None and self.queue.empty() and not self.playlist_tasks
             empty = not any(not member.bot for member in self.voice.channel.members)
             self.idle_since = (self.idle_since if self.idle_since is not None else now) if idle else None
             self.empty_since = (self.empty_since if self.empty_since is not None else now) if empty else None
@@ -172,8 +180,8 @@ class Music(commands.Cog):
     async def before_monitor(self) -> None:
         await self.bot.wait_until_ready()
 
-    @commands.hybrid_command(name="play", description="Queue one YouTube video and join your voice channel.")
-    @app_commands.describe(url="An HTTPS YouTube video link (playlists are not supported)")
+    @commands.hybrid_command(name="play", description="Queue a YouTube video or playlist and join your voice channel.")
+    @app_commands.describe(url="An HTTPS YouTube video or playlist link")
     async def play(self, ctx: commands.Context, url: str) -> None:
         canonical = youtube_url(url)
         await ctx.defer()
@@ -182,7 +190,7 @@ class Music(commands.Cog):
             if ctx.channel is None:
                 raise PlaybackError("Run this command in a server text channel.")
             if self.queue.full():
-                raise PlaybackError("The queue is full (50 videos). Try again after a song finishes.")
+                raise PlaybackError(f"The queue is full ({MAX_QUEUE:,} videos). Try again after a song finishes.")
             if self.voice is None or not self.voice.is_connected():
                 me = ctx.guild.me
                 permissions = channel.permissions_for(me)
@@ -194,12 +202,41 @@ class Music(commands.Cog):
                     self.voice = await channel.connect(timeout=20, reconnect=True, self_deaf=True)
                 except (discord.DiscordException, TimeoutError):
                     raise PlaybackError("Could not join voice. Check my permissions and try again.") from None
-            self.queue.put_nowait(Request(canonical, ctx.channel))
-            position = self.queue.qsize()
-        await ctx.send(
-            f"Queued at position {position}: <{canonical}>",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+            if urlsplit(canonical).path == "/playlist":
+                voice = self.voice
+                loading = asyncio.create_task(resolve_playlist(canonical, limit=MAX_QUEUE))
+                self.playlist_tasks.add(loading)
+            else:
+                self.queue.put_nowait(Request(canonical, ctx.channel))
+                message = f"Queued at position {self.queue.qsize()}: <{canonical}>"
+                loading = None
+        if loading is not None:
+            try:
+                try:
+                    playlist = await loading
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+                    raise PlaybackError("Playlist loading was cancelled. Nothing was added.") from None
+                async with self.lock:
+                    if self.voice is not voice or not voice.is_connected():
+                        raise PlaybackError("Playlist loading was cancelled by a voice disconnect. Nothing was added.")
+                    self.require_voice(ctx)
+                    available = MAX_QUEUE - self.queue.qsize()
+                    if len(playlist.urls) > available:
+                        raise PlaybackError(
+                            f"This playlist has {len(playlist.urls):,} accessible videos, but only "
+                            f"{available:,} queue spaces remain. Nothing was added."
+                        )
+                    for video_url in playlist.urls:
+                        self.queue.put_nowait(Request(video_url, ctx.channel))
+                title = discord.utils.escape_markdown(playlist.title)
+                message = f"Queued {len(playlist.urls):,} videos from **{title}** in playlist order."
+                if playlist.skipped:
+                    message += f" Skipped {playlist.skipped:,} unavailable entries."
+            finally:
+                self.playlist_tasks.discard(loading)
+        await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
 
     @commands.hybrid_command(name="pause", description="Pause the current video.")
     async def pause(self, ctx: commands.Context) -> None:

@@ -234,6 +234,7 @@ Slash commands are registered only in the configured `GUILD_ID` during startup. 
 ```text
 ~help
 ~play https://www.youtube.com/watch?v=jNQXAC9IVRw
+~play https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID
 ```
 
 `~help` lists all implemented commands automatically. Each command also has a `/` equivalent, sharing the same behavior and music queue.
@@ -242,7 +243,7 @@ Slash commands are registered only in the configured `GUILD_ID` during startup. 
 | --- | --- | --- |
 | `~help` | `/help` | List all available commands and usage |
 | `~ping` | `/ping` | Check connection and gateway latency |
-| `~play <link>` | `/play url` | Join your regular voice channel and queue one YouTube video |
+| `~play <link>` | `/play url` | Join your regular voice channel and queue a YouTube video or playlist |
 | `~pause` | `/pause` | Pause the current video |
 | `~resume` | `/resume` | Resume paused audio |
 | `~skip` | `/skip` | Skip the current video, including one still loading |
@@ -257,19 +258,25 @@ Check the setup in your server:
 1. Run `~help`, `~ping`, and `/help`. Confirm that help lists all nine commands and the slash commands still appear.
 2. Join with a human test account. Confirm the welcome message and default roles. If screening is enabled, verify that roles wait until acceptance.
 3. Leave with that account and confirm the goodbye message.
-4. Join a regular voice channel and queue two permitted YouTube videos. Try pause, resume, skip, queue, nowplaying, and stop.
+4. Join a regular voice channel and queue two permitted YouTube videos or a public playlist. Confirm playlist order, then try pause, resume, skip, queue, nowplaying, and stop. Try stop during playlist loading too.
 5. Attempt music controls from a different voice channel; they should be rejected.
 6. Queue an unavailable video followed by a playable video. Confirm the failure is reported, the queue continues, and membership messages still work.
 7. Let the queue empty, then separately leave voice while music is playing. In each case, check that the bot disconnects after about five minutes.
 8. Restart the container. Confirm the bot reconnects and the previous queue is gone.
 
-All music commands require joining the bot's voice channel. The first `/play` selects that channel; the bot stays there until disconnected. The queue accepts up to 50 upcoming videos. It disconnects after five minutes with no current/queued track, or five minutes without human listeners, checked every 15 seconds. Paused music counts as a current track.
+All music commands require joining the bot's voice channel. The first `/play` selects that channel; the bot stays there until disconnected. The queue accepts up to 1,000 upcoming videos. It disconnects after five minutes with no current/queued track or playlist being loaded, or five minutes without human listeners, checked every 15 seconds. Paused music counts as a current track.
 
 ### Supported music and membership behavior
 
-Use individual HTTPS YouTube video links: `youtube.com/watch?v=...`, `youtu.be/...`, `/shorts/...`, or `/embed/...`, including mobile and YouTube Music video links. Remove any `list` playlist parameter before submitting a video.
+Use HTTPS YouTube video links (`youtube.com/watch?v=...`, `youtu.be/...`, `/shorts/...`, or `/embed/...`) or playlist links (`youtube.com/playlist?list=...`), including mobile and YouTube Music links.
 
-Search terms, playlists, live streams, Spotify, Stage channels, and arbitrary audio URLs are not supported. Private or restricted videos may not play. YouTube extraction is unofficial and may fail because of source restrictions, anti-bot checks, network blocking, or upstream changes. Review the [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp) when updating its pinned dependencies, then rebuild the image. Discord voice uses DAVE support from `discord.py[voice]` and `davey`.
+**Playlist behavior:** a video link containing `list=...` queues the entire playlist from the beginning, ignoring its video position or `index` parameter. Remove `list` if you only want that video. Public and accessible unlisted playlists are supported; private playlists requiring a login are not. Replace `YOUR_PLAYLIST_ID` in the example with your playlist's real ID.
+
+Playlist tracks are appended in their original order, preserving repeated tracks. Entries identified as private, deleted, live, or otherwise unavailable are skipped, and the bot reports that count. If a queued track fails later, playback continues with the next track. Audio streams are resolved individually when each track reaches playback, rather than all at once.
+
+Playlists may contain up to 1,000 entries and must fit within the remaining queue space. If a playlist is too large or will not fit, the bot explains the limit and adds none of it; it never silently truncates the list. `~stop` cancels pending playlist loading, clears the queue, and disconnects. Imports time out after 60 seconds; an excessively slow playlist may need to be retried.
+
+Search terms, automatically generated YouTube Mixes (`RD...` lists), live streams, Spotify, Stage channels, and arbitrary audio URLs are not supported. Private or restricted videos may not play. YouTube extraction is unofficial and may fail because of source restrictions, anti-bot checks, network blocking, or upstream changes. Review the [yt-dlp documentation](https://github.com/yt-dlp/yt-dlp) when updating its pinned dependencies, then rebuild the image. Discord voice uses DAVE support from `discord.py[voice]` and `davey`.
 
 Use content you have permission to play and respect the service's terms. YouTube's [API policies](https://developers.google.com/youtube/terms/developer-policies) prohibit separating audio through their API; this bot does not use that API. There is no login-cookie or authentication-bypass setup.
 
@@ -286,4 +293,4 @@ Goodbye messages cover leaving, kicking, and banning without distinguishing the 
 | Default roles are missing | Check role IDs, Manage Roles, role ordering, and whether the member is still completing screening. |
 | Welcome/goodbye messages are missing | Check the text-channel IDs and View Channel/Send Messages permissions, including channel overrides. |
 | The bot cannot join or speak | Use a regular voice channel. Check View Channel, Connect, and Speak permissions. |
-| YouTube playback fails | Try another public video without a playlist parameter. Check the supported-music limitations above. |
+| YouTube playback fails | Try another public video or accessible playlist. Remove `list` to request only one video. Check the supported-music limitations above. |
