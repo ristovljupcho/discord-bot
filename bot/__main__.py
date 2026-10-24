@@ -1,17 +1,14 @@
 import asyncio
 import logging
 import os
-import shutil
 import signal
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.audio import PlaybackError
 from bot.config import Settings
 from bot.membership import Membership
-from bot.music import Music
 
 log = logging.getLogger(__name__)
 
@@ -25,11 +22,8 @@ class CommandTree(app_commands.CommandTree):
 
     async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         original = getattr(error, "original", error)
-        if isinstance(original, PlaybackError):
-            message = str(original)
-        else:
-            log.error("Slash command failed (%s).", type(original).__name__)
-            message = "The command failed. Check the bot logs and permissions, then try again."
+        log.error("Slash command failed (%s).", type(original).__name__)
+        message = "The command failed. Check the bot logs and permissions, then try again."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(message, ephemeral=True)
@@ -42,7 +36,7 @@ class CommandTree(app_commands.CommandTree):
 class PersonalBot(commands.Bot):
     def __init__(self, settings: Settings):
         intents = discord.Intents(
-            guilds=True, members=True, voice_states=True,
+            guilds=True, members=True,
             guild_messages=True, message_content=True,
         )
         super().__init__(
@@ -51,7 +45,6 @@ class PersonalBot(commands.Bot):
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.settings = settings
-        self.music: Music | None = None
         self.add_check(self.check_server)
 
     async def check_server(self, ctx: commands.Context) -> bool:
@@ -65,9 +58,7 @@ class PersonalBot(commands.Bot):
         original = getattr(error, "original", error)
         while isinstance(original, (commands.CommandInvokeError, commands.HybridCommandError, app_commands.CommandInvokeError)):
             original = original.original
-        if isinstance(original, PlaybackError):
-            message = str(original)
-        elif isinstance(error, commands.UserInputError):
+        if isinstance(error, commands.UserInputError):
             command = ctx.command
             message = f"Usage: `{self.command_prefix}{command.qualified_name} {command.signature}`"
         elif isinstance(error, commands.CheckFailure):
@@ -84,8 +75,6 @@ class PersonalBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.add_cog(Membership(self.settings))
-        self.music = Music(self, self.settings)
-        await self.add_cog(self.music)
 
         @self.hybrid_command(name="ping", description="Check that the bot is responding.")
         async def ping(ctx: commands.Context) -> None:
@@ -98,7 +87,7 @@ class PersonalBot(commands.Bot):
             for command in sorted(self.walk_commands(), key=lambda command: command.qualified_name):
                 usage = f"{prefix}{command.qualified_name} {command.signature}".rstrip()
                 lines.append(f"`{usage}` — {command.description}")
-            lines.append("\nThese commands also work with `/`. Join my voice channel for music controls.")
+            lines.append("\nThese commands also work with `/`.")
             await ctx.send("\n".join(lines), allowed_mentions=discord.AllowedMentions.none())
 
         guild = discord.Object(id=self.settings.guild_id)
@@ -127,19 +116,8 @@ class PersonalBot(commands.Bot):
                 if not permissions.view_channel or not permissions.send_messages:
                     log.error("View Channel or Send Messages is missing in channel %s.", channel_id)
 
-    async def close(self) -> None:
-        if self.music is not None:
-            await self.remove_cog(self.music.qualified_name)
-            self.music = None
-        await super().close()
-
 
 async def run(settings: Settings) -> None:
-    for executable in ("ffmpeg", "deno"):
-        if shutil.which(executable) is None:
-            raise RuntimeError(f"{executable} is missing. Use Docker or install it on PATH.")
-    import davey  # noqa: F401 -- fail immediately if voice encryption support is missing
-    discord.opus.Encoder()  # Verify the system Opus library before connecting.
     async with PersonalBot(settings) as bot:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
