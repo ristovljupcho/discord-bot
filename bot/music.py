@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 import logging
-import subprocess
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -78,41 +78,53 @@ class Music(commands.Cog):
         self.track = await resolve_track(request.url)
         if self.voice is None or not self.voice.is_connected():
             raise PlaybackError("The voice connection was lost. Use the play command to reconnect.")
-        source = discord.FFmpegPCMAudio(
-            self.track.stream_url,
-            before_options=(
-                "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-                "-rw_timeout 15000000 -protocol_whitelist https,tls,tcp,crypto,http"
-            ),
-            options="-vn -loglevel error",
-            stderr=subprocess.DEVNULL,
-        )
-        finished = asyncio.Event()
-        playback_error = []
-        loop = asyncio.get_running_loop()
+        # discord.py requires a file object here, not subprocess.DEVNULL.
+        with tempfile.TemporaryFile() as diagnostics:
+            source = discord.FFmpegPCMAudio(
+                self.track.stream_url,
+                before_options=(
+                    "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                    "-rw_timeout 15000000 -protocol_whitelist https,tls,tcp,crypto,http"
+                ),
+                options="-vn -loglevel error",
+                stderr=diagnostics,
+            )
+            finished = asyncio.Event()
+            playback_error = []
+            loop = asyncio.get_running_loop()
 
-        def after(error: Exception | None) -> None:
-            if error:
-                playback_error.append(error)
-            loop.call_soon_threadsafe(finished.set)
+            def after(error: Exception | None) -> None:
+                if error:
+                    playback_error.append(error)
+                loop.call_soon_threadsafe(finished.set)
 
-        try:
-            self.voice.play(source, after=after, bitrate=96)
-            title = discord.utils.escape_markdown(self.track.title)
-            await self.notify(request, f"Now playing: **{title}**\n<{request.url}>")
-            # Voice disconnection does not always call the audio player's callback.
-            while not finished.is_set():
-                try:
-                    await asyncio.wait_for(finished.wait(), timeout=2)
-                except TimeoutError:
-                    if self.voice is None or not self.voice.is_connected():
-                        raise PlaybackError("The voice connection was lost. Use the play command to reconnect.")
-            if playback_error:
-                raise PlaybackError("Audio playback failed. Trying the next queued video.")
-        finally:
-            if self.voice:
-                self.voice.stop()
-            source.cleanup()
+            try:
+                self.voice.play(source, after=after, bitrate=96)
+                title = discord.utils.escape_markdown(self.track.title)
+                await self.notify(request, f"Now playing: **{title}**\n<{request.url}>")
+                # Voice disconnection does not always call the audio player's callback.
+                while not finished.is_set():
+                    try:
+                        await asyncio.wait_for(finished.wait(), timeout=2)
+                    except TimeoutError:
+                        if self.voice is None or not self.voice.is_connected():
+                            raise PlaybackError("The voice connection was lost. Use the play command to reconnect.")
+                if playback_error:
+                    diagnostics.seek(0)
+                    details = diagnostics.read(8192).decode(errors="replace")
+                    reason = "Audio playback failed. Trying the next queued video."
+                    if "403 Forbidden" in details or "HTTP error 403" in details:
+                        reason = "YouTube rejected the audio stream (HTTP 403). Trying the next queued video."
+                    elif "429 Too Many Requests" in details or "HTTP error 429" in details:
+                        reason = "YouTube rate-limited the audio stream (HTTP 429). Try again later."
+                    elif "Protocol not found" in details or "not on whitelist" in details:
+                        reason = "FFmpeg cannot open this audio protocol. Check the bot installation."
+                    log.error("FFmpeg playback failed: %s", reason)
+                    raise PlaybackError(reason)
+            finally:
+                if self.voice:
+                    self.voice.stop()
+                source.cleanup()
 
     async def run_queue(self) -> None:
         while True:

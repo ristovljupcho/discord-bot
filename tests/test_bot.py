@@ -474,6 +474,32 @@ class MusicTests(unittest.IsolatedAsyncioTestCase):
         source.cleanup.assert_called_once()
         self.voice.stop.assert_called_once()
 
+    async def test_ffmpeg_receives_a_file_and_reports_http_rejection_without_signed_urls(self):
+        source = Mock()
+        captured = []
+
+        def make_source(url, **kwargs):
+            diagnostic_file = kwargs["stderr"]
+            diagnostic_file.fileno()  # DEVNULL is an int and fails this regression check.
+            diagnostic_file.write(b'HTTP error 403 Forbidden https://private.example/audio?secret=hidden')
+            diagnostic_file.flush()
+            captured.append(diagnostic_file)
+            return source
+
+        def play(_, *, after, bitrate):
+            after(RuntimeError("FFmpeg exited with code 1"))
+
+        self.voice.play.side_effect = play
+        with patch("bot.music.resolve_track", AsyncMock(return_value=Track("Test", "https://rr.googlevideo.com/a"))), patch(
+            "bot.music.discord.FFmpegPCMAudio", side_effect=make_source
+        ), self.assertLogs("bot.music", level="ERROR") as logs:
+            with self.assertRaisesRegex(PlaybackError, "403") as raised:
+                await self.cog.play_track(Request(URL, self.channel))
+        self.assertNotIn("secret=hidden", str(raised.exception))
+        self.assertNotIn("private.example", "\n".join(logs.output))
+        self.assertTrue(captured[0].closed)
+        source.cleanup.assert_called_once()
+
     async def test_pause_resume_and_empty_queue(self):
         self.voice.is_playing.return_value = True
         await self.cog.pause.callback(self.cog, self.ctx)

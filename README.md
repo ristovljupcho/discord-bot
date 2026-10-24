@@ -122,6 +122,7 @@ Stop the original instance before starting the new one. When moving between x86 
 | Container repeatedly restarts | Read `docker compose logs --tail 100 bot`. Check all required environment values and the Discord settings in Part 2. |
 | Environment changes are ignored | Save `.env`, then run `docker compose up -d --force-recreate`. |
 | Code changes are ignored | Run `docker compose up --build -d`. |
+| Playback logs show `AttributeError: 'int' object has no attribute 'write'` | Rebuild with `docker compose up --build -d`. This was a bug in FFmpeg error-output handling; restarting an old image will not apply the fix. |
 
 ### Development and dependency checks (optional)
 
@@ -294,3 +295,5 @@ Goodbye messages cover leaving, kicking, and banning without distinguishing the 
 | Welcome/goodbye messages are missing | Check the text-channel IDs and View Channel/Send Messages permissions, including channel overrides. |
 | The bot cannot join or speak | Use a regular voice channel. Check View Channel, Connect, and Speak permissions. |
 | YouTube playback fails | Try another public video or accessible playlist. Remove `list` to request only one video. Check the supported-music limitations above. |
+
+FFmpeg failures are reported as safe error categories in the bot logs, such as HTTP 403, HTTP 429, or an unsupported protocol. The raw FFmpeg output is captured in a temporary file and closed after playback; signed media URLs are not printed by this error handler. To inspect a failure after rebuilding, run `docker compose logs --since 2m bot`.
